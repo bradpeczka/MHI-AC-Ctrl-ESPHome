@@ -45,8 +45,71 @@ class MhiAcCtrl : public climate::Climate,
                   public Component,
                   public CallbackInterface_Status {
 public:
+    MhiAcCtrl() : use_hardware_spi_(true) {
+        // Initialize pointers to nullptr
+        pins_.mosi = nullptr;
+        pins_.miso = nullptr;
+        pins_.sclk = nullptr;
+        pins_.cs_in = nullptr;
+        pins_.cs_out = nullptr;
+    }
+
+    void set_mosi_pin(InternalGPIOPin *pin) {
+        pins_.mosi = pin;
+        this->ac_config_.mosi = static_cast<gpio_num_t>(pin->get_pin());
+    }
+    
+    void set_miso_pin(InternalGPIOPin *pin) {
+        pins_.miso = pin;
+        this->ac_config_.miso = static_cast<gpio_num_t>(pin->get_pin());
+    }
+    
+    void set_sclk_pin(InternalGPIOPin *pin) {
+        pins_.sclk = pin;
+        this->ac_config_.sclk = static_cast<gpio_num_t>(pin->get_pin());
+    }
+    
+    void set_cs_in_pin(InternalGPIOPin *pin) {
+        pins_.cs_in = pin;
+        this->ac_config_.cs_in = static_cast<gpio_num_t>(pin->get_pin());
+    }
+    
+    void set_cs_out_pin(InternalGPIOPin *pin) {
+        pins_.cs_out = pin;
+        this->ac_config_.cs_out = static_cast<gpio_num_t>(pin->get_pin());
+    }
+
     void setup() override
     {
+        // Try hardware SPI first
+        this->ac_config_.use_hardware_spi = true;
+        if (!mhi_ac_ctrl_core_init(this->ac_config_)) {
+            ESP_LOGW(TAG, "Hardware SPI initialization failed, falling back to software SPI");
+            use_hardware_spi_ = false;
+            
+            // Fall back to software SPI configuration
+            if (pins_.sclk != nullptr) {
+                pins_.sclk->setup();  // Configure as INPUT
+                pins_.sclk->pin_mode(gpio::FLAG_INPUT);
+            }
+            if (pins_.mosi != nullptr) {
+                pins_.mosi->setup();  // Configure as INPUT
+                pins_.mosi->pin_mode(gpio::FLAG_INPUT);
+            }
+            if (pins_.miso != nullptr) {
+                pins_.miso->setup();  // Configure as OUTPUT
+                pins_.miso->pin_mode(gpio::FLAG_OUTPUT);
+            }
+
+            // Initialize software SPI with the configured pins
+            this->ac_config_.use_hardware_spi = false;
+            if (!mhi_ac_ctrl_core_init(this->ac_config_)) {
+                ESP_LOGE(TAG, "Software SPI initialization also failed!");
+                this->mark_failed();
+                return;
+            }
+        }
+
         this->power_ = power_off;
         this->current_temperature = NAN;
         // restore set points
@@ -172,6 +235,12 @@ public:
         ESP_LOGCONFIG(TAG, "  Max. Temperature: %.1f°C", this->maximum_temperature_);
         ESP_LOGCONFIG(TAG, "  Supports HEAT: %s", YESNO(true));
         ESP_LOGCONFIG(TAG, "  Supports COOL: %s", YESNO(true));
+        ESP_LOGCONFIG(TAG, "  Mode: %s", use_hardware_spi_ ? "Hardware SPI" : "Software SPI");
+        ESP_LOGCONFIG(TAG, "  MOSI Pin: %d", pins_.mosi ? pins_.mosi->get_pin() : -1);
+        ESP_LOGCONFIG(TAG, "  MISO Pin: %d", pins_.miso ? pins_.miso->get_pin() : -1);
+        ESP_LOGCONFIG(TAG, "  SCLK Pin: %d", pins_.sclk ? pins_.sclk->get_pin() : -1);
+        ESP_LOGCONFIG(TAG, "  CS IN Pin: %d", pins_.cs_in ? pins_.cs_in->get_pin() : -1);
+        ESP_LOGCONFIG(TAG, "  CS OUT Pin: %d", pins_.cs_out ? pins_.cs_out->get_pin() : -1);
     }
 
     void cbiStatusFunction(ACStatus status, int value) override
@@ -560,6 +629,7 @@ public:
     }
 
 private:
+    Config ac_config_;
     int frame_size_;
     unsigned long room_temp_api_timeout_ms = millis(); // Timestamp in milliseconds
     unsigned long room_temp_api_timeout; // Timeout duration in seconds

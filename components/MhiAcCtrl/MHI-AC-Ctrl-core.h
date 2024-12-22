@@ -1,6 +1,10 @@
 #pragma once
 
 #include <Arduino.h>
+#include "driver/spi_slave.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
 
 // comment out the data you are not interested, but at least leave one row !
 const byte opdata[][2] PROGMEM = {
@@ -67,6 +71,23 @@ const byte opdata[][2] PROGMEM = {
 #define DB26 CBL + 12
 #define CBL2 DB26 + 1
 
+// Hardware SPI support
+#define RCV_HOST                    SPI2_HOST
+#define TIMER_DIVIDER               16
+#define TIMER_SCALE_MS              (TIMER_BASE_CLK / TIMER_DIVIDER / 1000)
+
+struct MHI_AC_Config {
+    bool use_hardware_spi;  // true for hardware SPI, false for software SPI
+    struct {
+        gpio_num_t mosi;
+        gpio_num_t miso;
+        gpio_num_t sclk;
+        gpio_num_t cs_in;   // Chip select input for hardware SPI
+        gpio_num_t cs_out;  // Chip select output for hardware SPI
+    } pins;
+    spi_host_device_t RCV_HOST;  // SPI host to use (e.g., SPI2_HOST)
+};
+
 enum ErrMsg {   // Error message enum
   err_msg_valid_frame = 0, err_msg_invalid_signature = -1, err_msg_invalid_checksum = -2, err_msg_timeout_SCK_low = -3, err_msg_timeout_SCK_high = -4
 };
@@ -84,8 +105,6 @@ enum ACStatus { // Status enum
   erropdata_iu_fanspeed, erropdata_total_iu_run, erropdata_outdoor, erropdata_tho_r1, erropdata_comp, erropdata_td, erropdata_ct, erropdata_ou_fanspeed,
   erropdata_total_comp_run, erropdata_ou_eev1, erropdata_errorcode
 };
-
-
 
 enum ACPower {  // Power enum
   power_off = 0, power_on = 1
@@ -113,6 +132,14 @@ class CallbackInterface_Status {
 
 class MHI_AC_Ctrl_Core {
   private:
+    // Add new members for hardware SPI support
+    MHI_AC_Config config;
+    bool hardware_spi_initialized;
+    TaskHandle_t mhi_poll_task_handle;
+    SemaphoreHandle_t miso_semaphore_handle;
+    StaticSemaphore_t miso_semaphore_buffer;
+    uint8_t *miso_frame;
+    uint8_t *mosi_frame;
     // old status
     byte status_power_old;
     byte status_mode_old;
@@ -166,10 +193,22 @@ class MHI_AC_Ctrl_Core {
     CallbackInterface_Status *m_cbiStatus;
 
   public:
+      MHI_AC_Ctrl_Core(const MHI_AC_Config& cfg) : config(cfg), hardware_spi_initialized(false) {
+        miso_frame = new uint8_t[frameSize];
+        mosi_frame = new uint8_t[frameSize];
+    }
+    
+    ~MHI_AC_Ctrl_Core() {
+        delete[] miso_frame;
+        delete[] mosi_frame;
+    }
+
+    // Add new method for hardware SPI initialization
+    bool init_hardware_spi();
+
     void MHIAcCtrlStatus(CallbackInterface_Status *cb) {
       m_cbiStatus = cb;
     };
-
 
     void init();                          // initialization called once after boot
     void reset_old_values();              // resets the 'old' variables ensuring that all status information are resend

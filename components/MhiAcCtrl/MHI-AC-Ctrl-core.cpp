@@ -52,12 +52,52 @@ void MHI_AC_Ctrl_Core::reset_old_values() {  // used e.g. when MQTT connection t
   op_ou_eev1_old = 0xffff;
 }
 
+void MHI_AC_Ctrl_Core::hardware_spi_task() {
+    esp_err_t err;
+    WORD_ALIGNED_ATTR uint8_t recvbuf[frameSize];
+    WORD_ALIGNED_ATTR uint8_t sendbuf[frameSize];
+    
+    spi_slave_transaction_t trans = {
+        .length = frameSize * 8,
+        .tx_buffer = sendbuf,
+        .rx_buffer = recvbuf
+    };
+
+    while (true) {
+        // Handle SPI communication using hardware SPI
+        if (xSemaphoreTake(miso_semaphore_handle, portMAX_DELAY) == pdTRUE) {
+            memcpy(sendbuf, miso_frame, frameSize);
+            xSemaphoreGive(miso_semaphore_handle);
+            
+            err = spi_slave_queue_trans(config.RCV_HOST, &trans, portMAX_DELAY);
+            if (err == ESP_OK) {
+                spi_slave_transaction_t *out_trans;
+                err = spi_slave_get_trans_result(config.RCV_HOST, &out_trans, portMAX_DELAY);
+                if (err == ESP_OK) {
+                    process_received_frame(recvbuf);
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(20)); // 20ms delay between frames
+    }
+}
+
 void MHI_AC_Ctrl_Core::init() {
-  //MeasureFrequency(m_cbiStatus);
-  pinMode(SCK_PIN, INPUT);
-  pinMode(MOSI_PIN, INPUT);
-  pinMode(MISO_PIN, OUTPUT);
-  MHI_AC_Ctrl_Core::reset_old_values();
+    if (config.use_hardware_spi) {
+        if (!init_hardware_spi()) {
+            // Fall back to software SPI if hardware initialization fails
+            config.use_hardware_spi = false;
+        }
+    }
+    
+    if (!config.use_hardware_spi) {
+        // Original software SPI initialization
+        pinMode(SCK_PIN, INPUT);
+        pinMode(MOSI_PIN, INPUT);
+        pinMode(MISO_PIN, OUTPUT);
+    }
+    
+    MHI_AC_Ctrl_Core::reset_old_values();
 }
 
 void MHI_AC_Ctrl_Core::set_power(boolean power) {
@@ -122,7 +162,111 @@ void MHI_AC_Ctrl_Core::set_frame_size(byte framesize) {
     frameSize = framesize;
 }
 
+bool MHI_AC_Ctrl_Core::init_hardware_spi() {
+    esp_err_t err;
+
+    // Initialize semaphore for MISO frame access
+    miso_semaphore_handle = xSemaphoreCreateMutexStatic(&miso_semaphore_buffer);
+
+    // Configure SPI bus
+    spi_bus_config_t buscfg = {
+        .mosi_io_num = config.pins.mosi,
+        .miso_io_num = config.pins.miso,
+        .sclk_io_num = config.pins.sclk,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .data4_io_num = -1,
+        .data5_io_num = -1,
+        .data6_io_num = -1,
+        .data7_io_num = -1,
+        .max_transfer_sz = 0,
+        .flags = SPICOMMON_BUSFLAG_GPIO_PINS | SPICOMMON_BUSFLAG_SLAVE,
+        .intr_flags = 0
+    };
+
+    // Configure SPI slave interface
+    spi_slave_interface_config_t slvcfg = {
+        .spics_io_num = config.pins.cs_in,
+        .flags = SPI_SLAVE_BIT_LSBFIRST,
+        .queue_size = 1,
+        .mode = 3,  // CPOL=1, CPHA=1
+        .post_setup_cb = nullptr,
+        .post_trans_cb = nullptr
+    };
+
+    // Initialize SPI slave interface
+    err = spi_slave_initialize(config.RCV_HOST, &buscfg, &slvcfg, SPI_DMA_CH_AUTO);
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    // Configure timer for frame timing
+    timer_config_t timer_config = {
+        .alarm_en = TIMER_ALARM_DIS,
+        .counter_en = TIMER_PAUSE,
+        .intr_type = TIMER_INTR_LEVEL,
+        .counter_dir = TIMER_COUNT_UP,
+        .auto_reload = TIMER_AUTORELOAD_DIS,
+        .divider = TIMER_DIVIDER,
+    };
+    
+    err = timer_init(TIMER_GROUP_0, TIMER_0, &timer_config);
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    // Configure timer alarm
+    err = timer_set_alarm_value(TIMER_GROUP_0, TIMER_0, 20 * TIMER_SCALE_MS);
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    err = timer_enable_intr(TIMER_GROUP_0, TIMER_0);
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    // Configure CS output pin
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << config.pins.cs_out),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    
+    err = gpio_config(&io_conf);
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    gpio_set_level(config.pins.cs_out, 1);
+
+    // Create task for handling SPI communication
+    BaseType_t task_created = xTaskCreatePinnedToCore(
+        [](void* arg) { static_cast<MHI_AC_Ctrl_Core*>(arg)->hardware_spi_task(); },
+        "mhi_task",
+        4096,
+        this,
+        10,
+        &mhi_poll_task_handle,
+        1
+    );
+
+    if (task_created != pdPASS) {
+        return false;
+    }
+
+    hardware_spi_initialized = true;
+    return true;
+}
+
 int MHI_AC_Ctrl_Core::loop(uint max_time_ms) {
+  if (config.use_hardware_spi) {
+      // Hardware SPI is handled by the task
+      vTaskDelay(pdMS_TO_TICKS(max_time_ms));
+      return err_msg_valid_frame;
+  } else {
   const byte opdataCnt = sizeof(opdata) / sizeof(byte) / 2;
   static byte opdataNo = 0;               //
   long startMillis = millis();             // start time of this loop run
